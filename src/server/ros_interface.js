@@ -13,11 +13,69 @@ let publishers = {
     pose: null,
     microphone: null, // Changed from audio to microphone
     imu: null, // Added IMU publisher
-    gps: null  // Added GPS publisher
+    gps: null,  // Added GPS publisher
+  tf: null    // Added TF broadcaster (tf2_msgs/TFMessage on 'tf')
 };
 
 // Store node reference
 let rosNode = null;
+let useSimTime = false;
+let lastSimTime = null; // {sec, nanosec} from /clock
+let clockWarned = false;
+
+function getRosStamp(preferredStamp) {
+  // If sim time is enabled and we have a clock value, use it
+  if (useSimTime && lastSimTime && typeof lastSimTime.sec === 'number' && typeof lastSimTime.nanosec === 'number') {
+    return { sec: lastSimTime.sec, nanosec: lastSimTime.nanosec };
+  }
+  // Otherwise, fall back to provided stamp if present
+  if (preferredStamp && typeof preferredStamp.sec === 'number' && typeof preferredStamp.nanosec === 'number') {
+    return preferredStamp;
+  }
+  // Finally, use wall clock time
+  const nowMs = Date.now();
+  return { sec: Math.floor(nowMs / 1000), nanosec: (nowMs % 1000) * 1000000 };
+}
+
+// Helper: Convert quaternion (x,y,z,w) to Euler angles (roll, pitch, yaw) in radians
+function quaternionToEuler(q) {
+  const x = q.x || 0.0;
+  const y = q.y || 0.0;
+  const z = q.z || 0.0;
+  const w = q.w !== undefined ? q.w : 1.0;
+  // Roll (X axis)
+  const sinr_cosr = 2 * (w * x + y * z);
+  const cosr_cosr = 1 - 2 * (x * x + y * y);
+  const roll = Math.atan2(sinr_cosr, cosr_cosr);
+  // Pitch (Y axis)
+  let sinp = 2 * (w * y - z * x);
+  if (sinp > 1) sinp = 1; else if (sinp < -1) sinp = -1; // Clamp
+  const pitch = Math.asin(sinp);
+  // Yaw (Z axis)
+  const siny_cosy = 2 * (w * z + x * y);
+  const cosy_cosy = 1 - 2 * (y * y + z * z);
+  const yaw = Math.atan2(siny_cosy, cosy_cosy);
+  return { roll, pitch, yaw };
+}
+
+// Helper: Convert Euler angles (roll, pitch, yaw) in radians back to quaternion (x,y,z,w)
+function eulerToQuaternion(roll, pitch, yaw) {
+  const halfRoll = roll * 0.5;
+  const halfPitch = pitch * 0.5;
+  const halfYaw = yaw * 0.5;
+  const cr = Math.cos(halfRoll);
+  const sr = Math.sin(halfRoll);
+  const cp = Math.cos(halfPitch);
+  const sp = Math.sin(halfPitch);
+  const cy = Math.cos(halfYaw);
+  const sy = Math.sin(halfYaw);
+  return {
+    w: cr * cp * cy + sr * sp * sy,
+    x: sr * cp * cy - cr * sp * sy,
+    y: cr * sp * cy + sr * cp * sy,
+    z: cr * cp * sy - sr * sp * cy
+  };
+}
 
 // Initialize the ROS2 node and set up publishers and subscribers
 async function initRos(wssTTS, wssWavAudio) {
@@ -67,6 +125,95 @@ async function initRos(wssTTS, wssWavAudio) {
     'mobile_sensor/gps',
     { qos: { depth: 10 } }
   );
+  
+  // Add TF publisher for broadcasting transforms (dynamic TF)
+  publishers.tf = node.createPublisher(
+    'tf2_msgs/msg/TFMessage',
+    'tf',
+    { qos: { depth: 10 } }
+  );
+  // Static TF is now handled by tf2_ros/static_transform_publisher in the launch file
+
+  // Declare parameters (individual declarations for compatibility)
+  try { node.declareParameter(new rclnodejs.Parameter('use_sim_time', rclnodejs.ParameterType.PARAMETER_BOOL, true)); } catch (_) {Logger.error('ROS', 'Parameter use_sim_time declaration failed');}
+  try { node.declareParameter(new rclnodejs.Parameter('tf_parent_frame', rclnodejs.ParameterType.PARAMETER_STRING, 'map')); } catch (_) {Logger.error('ROS', 'Parameter tf_parent_frame declaration failed');}
+  try { node.declareParameter(new rclnodejs.Parameter('tf_child_frame', rclnodejs.ParameterType.PARAMETER_STRING, 'mobile_sensor')); } catch (_) { Logger.error('ROS', 'Parameter tf_child_frame declaration failed');}
+  try { node.declareParameter(new rclnodejs.Parameter('pose_map_position', rclnodejs.ParameterType.PARAMETER_STRING_ARRAY, ['z','x','y'])); } catch (_) { Logger.error('ROS', 'Parameter pose_map_position declaration failed');}
+
+  try {
+    const p = node.getParameter('use_sim_time');
+    useSimTime = !!(p && (p.value === true || p.value === 'true'));
+  } catch (e) {
+    useSimTime = false;
+  }
+  if (useSimTime) {
+    node.createSubscription(
+      'rosgraph_msgs/msg/Clock',
+      '/clock',
+      (msg) => {
+        if (msg && msg.clock) {
+          lastSimTime = { sec: msg.clock.sec, nanosec: msg.clock.nanosec };
+        }
+      },
+      { qos: { depth: 10 } }
+    );
+    Logger.info('ROS', 'use_sim_time enabled: subscribing to /clock');
+
+    // Schedule a one-time warning if /clock is not publishing soon
+    setTimeout(() => {
+      if (useSimTime && !lastSimTime && !clockWarned) {
+        Logger.warn('ROS', 'use_sim_time is true but no /clock messages received after 5s');
+        clockWarned = true;
+      }
+    }, 5000);
+  }
+  // Pose axis mapping: list of 3 tokens (x,y,z with optional '-') mapping incoming pose axes to ROS X,Y,Z
+  // Helper to map position with sign adjustments
+  function mapPosePosition(rawPos) {
+    let mapParam;
+    try { mapParam = node.getParameter('pose_map_position'); } catch (e) {}
+    // Default mapping Android device (X right, Y up, Z out-of-screen)
+    // to ROS FLU (X forward, Y left, Z up): [ROSx, ROSy, ROSz] = ['z','-x','y']
+    let spec = ['z','-x','y'];
+    if (mapParam && mapParam.value !== undefined) {
+      if (Array.isArray(mapParam.value) && mapParam.value.length === 3) {
+        spec = mapParam.value;
+      } else if (typeof mapParam.value === 'string') {
+        const v = mapParam.value.trim();
+        try {
+          // Try JSON-like array first
+          if (v.startsWith('[')) {
+            const parsed = JSON.parse(v.replace(/'/g, '"'));
+            if (Array.isArray(parsed) && parsed.length === 3) spec = parsed;
+          } else {
+            // Comma-separated list
+            const parts = v.split(',').map(s => s.trim()).filter(Boolean);
+            if (parts.length === 3) spec = parts;
+          }
+        } catch (_) {
+          // Fallback: keep default
+        }
+      }
+    }
+    const resolve = (token) => {
+      let sign = 1;
+      if (token.startsWith('-')) { sign = -1; token = token.substring(1); }
+      const val = (token === 'x') ? rawPos.x : (token === 'y') ? rawPos.y : rawPos.z;
+      return sign * (val || 0.0);
+    };
+    return { x: resolve(spec[0]), y: resolve(spec[1]), z: resolve(spec[2]) };
+  }
+  node._poseMapPosition = mapPosePosition;
+
+  // Log effective parameters once for visibility
+  try {
+    const parentFrameParam = node.getParameter('tf_parent_frame');
+    const childFrameParam = node.getParameter('tf_child_frame');
+    const poseMapParam = node.getParameter('pose_map_position');
+    Logger.info('PARAM', `tf_parent_frame=${parentFrameParam?.value || 'map'}, tf_child_frame=${childFrameParam?.value || 'mobile_sensor'}, pose_map_position=${poseMapParam?.value || "['z','-x','y']"}`);
+  } catch (_) {}
+
+  // Static transform publication removed; handled in launch via tf2_ros/static_transform_publisher
   
   // Add string subscriber for TTS
   node.createSubscription(
@@ -213,10 +360,7 @@ function publishCameraData(imageBuffer, width, height, timestamp) {
   
   // Generate standard header
   const header = {
-    stamp: timestamp || {
-      sec: Math.floor(Date.now() / 1000),
-      nanosec: (Date.now() % 1000) * 1000000
-    },
+    stamp: getRosStamp(timestamp),
     frame_id: 'camera_frame'
   };
   
@@ -268,21 +412,114 @@ function publishCameraData(imageBuffer, width, height, timestamp) {
 // Method to publish pose data
 function publishPoseData(poseData, timestamp) {
   if (!publishers.pose) return false;
-  
+  // Apply position axis remapping if helper exists
+  const mappedPos = (rosNode && rosNode._poseMapPosition) ? rosNode._poseMapPosition(poseData.position || {}) : {
+    x: poseData.position.x,
+    y: poseData.position.y,
+    z: poseData.position.z
+  };
+  // Start from device-provided orientation quaternion
+  const deviceOri = {
+    x: (poseData.orientation && poseData.orientation.x) || 0.0,
+    y: (poseData.orientation && poseData.orientation.y) || 0.0,
+    z: (poseData.orientation && poseData.orientation.z) || 0.0,
+    w: (poseData.orientation && poseData.orientation.w) || 1.0
+  };
+  // Convert to Euler (roll=X, pitch=Y, yaw=Z), apply same axis mapping as position, then back to quaternion
+  const devEuler = quaternionToEuler(deviceOri);
+  // Retrieve mapping spec from parameter (same logic as position)
+  let spec = ['z','-x','y'];
+  try {
+    const mapParam = rosNode ? rosNode.getParameter('pose_map_position') : null;
+    if (mapParam && mapParam.value !== undefined) {
+      if (Array.isArray(mapParam.value) && mapParam.value.length === 3) {
+        spec = mapParam.value;
+      } else if (typeof mapParam.value === 'string') {
+        const v = mapParam.value.trim();
+        if (v.startsWith('[')) {
+          const parsed = JSON.parse(v.replace(/'/g, '"'));
+          if (Array.isArray(parsed) && parsed.length === 3) spec = parsed;
+        } else {
+          const parts = v.split(',').map(s => s.trim()).filter(Boolean);
+          if (parts.length === 3) spec = parts;
+        }
+      }
+    }
+  } catch (_) {}
+  const axisAngle = (tok) => {
+    let sign = 1;
+    if (tok.startsWith('-')) { sign = -1; tok = tok.substring(1); }
+    const a = (tok === 'x') ? devEuler.roll : (tok === 'y') ? devEuler.pitch : devEuler.yaw;
+    return sign * a;
+  };
+  const mappedEuler = { roll: axisAngle(spec[0]), pitch: axisAngle(spec[1]), yaw: axisAngle(spec[2]) };
+  const mappedOri = eulerToQuaternion(mappedEuler.roll, mappedEuler.pitch, mappedEuler.yaw);
+
   const poseMsg = {
-    position: {
-      x: poseData.position.x,
-      y: poseData.position.y,
-      z: poseData.position.z
-    },
+    position: mappedPos,
     orientation: {
-      x: poseData.orientation.x,
-      y: poseData.orientation.y,
-      z: poseData.orientation.z,
-      w: poseData.orientation.w
+      x: mappedOri.x,
+      y: mappedOri.y,
+      z: mappedOri.z,
+      w: mappedOri.w
     }
   };
   publishers.pose.publish(poseMsg);
+
+  // Log Euler angles converted from quaternion for debugging
+  // const euler = mappedEuler; // already computed
+  // if (euler && typeof euler.roll === 'number') {
+  //   Logger.info('POSE_EULER', `roll=${euler.roll.toFixed(3)} pitch=${euler.pitch.toFixed(3)} yaw=${euler.yaw.toFixed(3)} rad | roll=${(euler.roll*180/Math.PI).toFixed(1)}° pitch=${(euler.pitch*180/Math.PI).toFixed(1)}° yaw=${(euler.yaw*180/Math.PI).toFixed(1)}°`);
+  //   Logger.info('POSE_QUAT mapped', `x=${mappedOri.x.toFixed(3)} y=${mappedOri.y.toFixed(3)} z=${mappedOri.z.toFixed(3)} w=${mappedOri.w.toFixed(3)}`);
+  // }
+  
+  // Also publish the pose as a TF transform using configured frames
+  if (publishers.tf && rosNode) {
+    const stamp = getRosStamp(timestamp);
+
+    // Read frame IDs from ROS parameters (fallback to defaults)
+    let parentFrame = 'map';
+    let childFrame = 'mobile_sensor';
+    try {
+      const parentParam = rosNode.getParameter('tf_parent_frame');
+      const childParam = rosNode.getParameter('tf_child_frame');
+      if (parentParam && typeof parentParam.value === 'string' && parentParam.value.length > 0) {
+        parentFrame = parentParam.value;
+      }
+      if (childParam && typeof childParam.value === 'string' && childParam.value.length > 0) {
+        childFrame = childParam.value;
+      }
+    } catch (e) {
+      // keep defaults if parameters are not available
+    }
+
+    const tfMsg = {
+      transforms: [
+        {
+          header: {
+            stamp: stamp,
+            frame_id: parentFrame
+          },
+          child_frame_id: childFrame,
+          transform: {
+            translation: {
+              x: mappedPos.x,
+              y: mappedPos.y,
+              z: mappedPos.z
+            },
+            rotation: {
+              x: mappedOri.x,
+              y: mappedOri.y,
+              z: mappedOri.z,
+              w: mappedOri.w
+            }
+          }
+        }
+      ]
+    };
+
+    publishers.tf.publish(tfMsg);
+  }
   
   return true;
 }
@@ -294,10 +531,7 @@ function publishMicrophoneTranscription(transcription, timestamp) {
   // Create timestamped message with header
   const msg = {
     header: {
-      stamp: timestamp || {
-        sec: Math.floor(Date.now() / 1000),
-        nanosec: (Date.now() % 1000) * 1000000
-      },
+      stamp: getRosStamp(timestamp),
       frame_id: 'microphone_frame'
     },
     data: transcription
@@ -313,44 +547,27 @@ function publishIMUData(imuData, timestamp) {
   
   // Generate standard header
   const header = {
-    stamp: timestamp || {
-      sec: Math.floor(Date.now() / 1000),
-      nanosec: (Date.now() % 1000) * 1000000
-    },
+    stamp: getRosStamp(timestamp),
     frame_id: 'imu_frame'
   };
   
-  // Create IMU message according to sensor_msgs/msg/Imu format
-  // http://docs.ros.org/en/melodic/api/sensor_msgs/html/msg/Imu.html
+  // Apply configured axis mappings
+  const mappedAccel = (rosNode && rosNode._imuMapLinear) ? rosNode._imuMapLinear(imuData.accelerometer || {}) : {
+    x: imuData.accelerometer.x || 0.0,
+    y: imuData.accelerometer.y || 0.0,
+    z: imuData.accelerometer.z || 0.0
+  };
+  const mappedGyro = (rosNode && rosNode._imuMapAngular) ? rosNode._imuMapAngular(imuData.gyroscope || {}) : {
+    x: imuData.gyroscope.beta || 0.0,
+    y: imuData.gyroscope.gamma || 0.0,
+    z: imuData.gyroscope.alpha || 0.0
+  };
+
   const imuMsg = {
     header: header,
-    
-    // Linear acceleration in m/s^2
-    linear_acceleration: {
-      x: imuData.accelerometer.x || 0.0,
-      y: imuData.accelerometer.y || 0.0,
-      z: imuData.accelerometer.z || 0.0
-    },
-    
-    // Angular velocity in rad/s
-    // alpha (z), beta (x), gamma (y) from gyroscope data
-    angular_velocity: {
-      x: imuData.gyroscope.beta || 0.0,  // beta is rotation around x-axis
-      y: imuData.gyroscope.gamma || 0.0, // gamma is rotation around y-axis
-      z: imuData.gyroscope.alpha || 0.0  // alpha is rotation around z-axis
-    },
-    
-    // Set default identity quaternion for orientation
-    // We're no longer collecting orientation data
-    orientation: {
-      x: 0.0,
-      y: 0.0,
-      z: 0.0,
-      w: 1.0
-    },
-    
-    // Covariance matrices (9x9 arrays) - using default values
-    // -1 indicates that the covariance is unknown
+    linear_acceleration: mappedAccel,
+    angular_velocity: mappedGyro,
+    orientation: { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
     orientation_covariance: new Array(9).fill(-1),
     angular_velocity_covariance: new Array(9).fill(-1),
     linear_acceleration_covariance: new Array(9).fill(-1)
@@ -366,10 +583,7 @@ function publishGPSData(gpsData, timestamp) {
   
   // Generate standard header
   const header = {
-    stamp: timestamp || {
-      sec: Math.floor(Date.now() / 1000),
-      nanosec: (Date.now() % 1000) * 1000000
-    },
+    stamp: getRosStamp(timestamp),
     frame_id: 'gps_frame'
   };
   
@@ -422,5 +636,7 @@ module.exports = {
   publishMicrophoneTranscription, // Renamed from publishAudioTranscription
   publishIMUData, // Added for iOS IMU sensor data
   publishGPSData, // Added for GPS location data
-  getPublishers: () => publishers
+  getPublishers: () => publishers,
+  quaternionToEuler,
+  eulerToQuaternion
 };

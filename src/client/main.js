@@ -18,7 +18,7 @@ let cameraSendingActive = false;
 // Add sensor selection states
 let enabledSensors = {
   camera: true,
-  pose: false,  // 3D Position disabled by default
+  pose: true,
   microphone: true,
   audio: true,
   imu: true,  // Added for iOS IMU sensor data

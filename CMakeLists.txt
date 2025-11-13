@@ -43,6 +43,7 @@ install(DIRECTORY
   dist
   launch
   node_modules
+  rviz
   DESTINATION share/${PROJECT_NAME}/
   OPTIONAL
  )

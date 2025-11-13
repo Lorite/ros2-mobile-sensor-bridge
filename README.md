@@ -37,15 +37,43 @@ Publishes:
 Subscribes:
 - `/mobile_sensor/tts` (`std_msgs/String`) – plain text TTS
 
+## TF + Axis Mapping
+
+- TF is published on `/tf` using configurable frames:
+   - Parent: `tf_parent_frame` (default: `map`)
+   - Child: `tf_child_frame` (default: `mobile_sensor`)
+- Android device axes are mapped to ROS FLU by default using `pose_map_position`:
+   - Android: X = right, Y = up, Z = out-of-screen
+   - ROS (FLU): X = forward, Y = left, Z = up
+   - Default mapping: `['z','x','y']` which means `[ROSx, ROSy, ROSz] = [devZ, devX, devY]`.
+- The same mapping is applied to both pose position and orientation:
+   - Orientation mapping converts the reported quaternion → Euler (roll=X, pitch=Y, yaw=Z),
+      applies the axis/sign remap, then converts back to quaternion for publishing.
+
+### Change mapping or frames at runtime
+
+```zsh
+ros2 param set /mobile_sensor_node pose_map_position "z,x,y"
+ros2 param set /mobile_sensor_node tf_parent_frame map
+ros2 param set /mobile_sensor_node tf_child_frame mobile_sensor
+```
+
+### Visualize in RViz2
+
+- Launching the node starts RViz2 with a TF-focused config (`mobile_sensor.rviz`) so you can see frames immediately.
+- Fixed frame defaults to `map`; an Axes display is attached to `mobile_sensor`.
+
 ## Prerequisites
 
 ### Requirements
+
 - ROS 2 Humble [Tested]
 - Node.js 20+
 - OpenSSL (for certificate generation)
 - Shared Wi‑Fi network between device and ROS host
 
 ### Installation
+
 ```bash
 cd <ros2_ws>/src
 git clone https://github.com/VedantC2307/ros2-mobile-sensor-bridge.git mobile_sensor
@@ -60,55 +88,41 @@ source install/setup.bash
 ```
 
 ### Launch
+
 ```bash
 ros2 launch mobile_sensor mobile_sensors.launch.py
 ```
 Console prints the HTTPS URL (e.g. `https://<host_ip>:4000`).
 
 ### Connect Device
+
 1. Open the printed URL in mobile browser (allow self‑signed cert).
 2. Grant permissions: camera, microphone, location, motion sensors.
 3. Select sensors and start streaming.
 
 
 ## Usual Commands
+
 Publish TTS text:
+
 ```bash
 ros2 topic pub -1 /mobile_sensor/tts std_msgs/msg/String "{data: 'Hello from ROS'}"
 ```
 
 Monitor:
+
 ```bash
 ros2 topic hz /camera/image_raw/compressed
 ros2 topic echo /mobile_sensor/imu
 ros2 topic echo /mobile_sensor/gps
 ```
 View camera:
+
 ```bash
 ros2 run rqt_image_view rqt_image_view
 ```
 
-<!-- ## 8. Topic Summary
-| Topic | Type | Direction | Notes |
-|-------|------|-----------|-------|
-| /camera/image_raw/compressed | sensor_msgs/CompressedImage | publish | JPEG frames |
-| /camera/camera_info | sensor_msgs/CameraInfo | publish | Basic intrinsics (identity defaults) |
-| /mobile_sensor/imu | sensor_msgs/Imu | publish | Accel + gyro; orientation = identity |
-| /mobile_sensor/gps | sensor_msgs/NavSatFix | publish | Covariance diagonal from accuracy |
-| /mobile_sensor/pose | geometry_msgs/Pose | publish | Provided if WebXR pose available |
-| /mobile_sensor/speech | std_msgs/String | publish | Wake‑word gated transcription |
-| /mobile_sensor/tts | std_msgs/String | subscribe | Text to device TTS |
-| /mobile_sensor/tts_wav | std_msgs/UInt8MultiArray | subscribe | WAV audio bytes |
-| /mobile_sensor/wav_bytes | std_msgs/UInt8MultiArray | subscribe | Legacy WAV channel | -->
-
-<!-- ## Docker (Optional)
-```bash
-docker-compose build
-docker-compose up
-# or
-docker build -t mobile-sensor-bridge -f docker/Dockerfile .
-docker run -p 4000:4000 -p 3000:3000 mobile-sensor-bridge
-``` -->
+<!-- Optional sections (Topic Summary, Docker) removed to satisfy markdown lint rules. -->
 
 ## Troubleshooting
 
@@ -125,14 +139,11 @@ If the UI loads fine on your laptop but your mobile browser shows ERR_EMPTY_RESP
 Let us know if these steps help or if you’re still having issues after trying them!
 
 ## Contributing
+
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
-<div align="center">
-
-**Made with ❤️ for the Robotics Community**
+### Made with ❤️ for the Robotics Community
 
 [🌟 Star this repo](https://github.com/VedantC2307/ros2-mobile-sensor-bridge) • [🐛 Report Bug](https://github.com/VedantC2307/ros2-mobile-sensor-bridge/issues) • [💡 Request Feature](https://github.com/VedantC2307/ros2-mobile-sensor-bridge/issues/new)
-
-</div>
